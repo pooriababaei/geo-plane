@@ -177,12 +177,63 @@ def plot_overlay(
     return fig
 
 
+def calculate_confidence(candidate: CandidateLocation) -> int:
+    """
+    Calculate an intuitive confidence score from 0 to 100%.
+
+    Factors:
+    - Number of matched flights (multi-aircraft multilateration).
+    - Unexplained pass ratio (passes detected vs explained).
+    - Average RMS fit residual of matched Doppler curves.
+    - Clock offset spread between matched flights.
+    """
+    n_matches = len(candidate.flight_matches)
+    n_unexplained = candidate.n_unexplained_passes
+    total_passes = n_matches + n_unexplained
+
+    if n_matches == 0:
+        return 0
+
+    # Base confidence based on matches vs total passes
+    match_ratio = n_matches / max(1, total_passes)
+    
+    # Residual factor (lower residual = higher confidence)
+    avg_rms = sum(m.rms_residual_hz for m in candidate.flight_matches) / n_matches
+    # 0 Hz -> 1.0, 10 Hz -> 0.7, 20 Hz -> 0.3, >30 Hz -> 0.0
+    rms_factor = max(0.0, 1.0 - (avg_rms / 30.0))
+
+    # Multi-plane multilateration bonus:
+    # 1 plane = max 55% (corridor ambiguity)
+    # 2 planes = up to 85%
+    # 3+ planes = up to 98%
+    if n_matches == 1:
+        max_possible = 55.0
+    elif n_matches == 2:
+        max_possible = 85.0
+    else:
+        max_possible = 98.0
+
+    score = max_possible * match_ratio * (0.6 + 0.4 * rms_factor)
+    return int(max(0, min(99, round(score))))
+
+
 def print_summary(candidates: list[CandidateLocation], top_n: int = 5) -> str:
     """
     Generate a human-readable summary of top candidates.
-
-    Returns the summary string.
+    If confidence is less than 50%, displays only the single top estimate
+    with a clear advisory instead of multiple confusing tie points.
     """
+    if not candidates:
+        return "No candidate locations found."
+
+    top_cand = candidates[0]
+    top_confidence = calculate_confidence(top_cand)
+    is_low_confidence = top_confidence < 50
+
+    # If confidence is less than 50%, restrict output to 1 candidate
+    display_n = 1 if is_low_confidence else top_n
+    display_candidates = candidates[:display_n]
+
     lines = [
         "=" * 70,
         "  AIRCRAFT-NOISE GEOLOCATION RESULTS",
@@ -190,8 +241,15 @@ def print_summary(candidates: list[CandidateLocation], top_n: int = 5) -> str:
         "",
     ]
 
-    for i, c in enumerate(candidates[:top_n]):
-        lines.append(f"  #{i + 1}  ({c.lat:.6f}, {c.lon:.6f})  score={c.total_score:.2f}")
+    if is_low_confidence:
+        lines.append("  ⚠️  LOW CONFIDENCE WARNING: Insufficient distinct crossing flights")
+        lines.append("      detected to calculate a tight crosshair. Indoor recordings or")
+        lines.append("      single flybys restrict the solution to a broad acoustic corridor.")
+        lines.append("")
+
+    for i, c in enumerate(display_candidates):
+        conf = calculate_confidence(c)
+        lines.append(f"  #{i + 1}  ({c.lat:.6f}, {c.lon:.6f})  Confidence: {conf}/100")
         lines.append(
             f"       https://www.google.com/maps?q={c.lat:.6f},{c.lon:.6f}"
         )

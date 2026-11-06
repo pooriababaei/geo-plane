@@ -445,7 +445,12 @@ def main(
         sys.exit(1)
 
     # === Step 6: Report ===
-    click.echo(f"\n📍 Top {min(top, len(candidates))} candidates:")
+    from .report import calculate_confidence
+    top_conf = calculate_confidence(candidates[0])
+    if top_conf < 50:
+        click.echo("\n📍 Result (Low Confidence):")
+    else:
+        click.echo(f"\n📍 Top {min(top, len(candidates))} candidates:")
     summary = print_summary(candidates, top_n=top)
 
     # Save results

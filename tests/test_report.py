@@ -90,7 +90,7 @@ class TestPrintSummary:
         assert "#1" in summary
         assert "39.856100" in summary
         assert "UAL123" in summary
-        assert "score=1.23" in summary
+        assert "Confidence: " in summary
         assert "#2" in summary
         assert "1 unexplained pass(es)" in summary
 

@@ -334,7 +334,7 @@ def fit_f0_and_offset(
     # Polish offset in neighborhood using minimize_scalar (Brent)
     bracket_min = max(offset_range[0], best_offset - 2.0)
     bracket_max = min(offset_range[1], best_offset + 2.0)
-    if bracket_max > bracket_min:
+    if bracket_min < best_offset < bracket_max:
         from scipy.optimize import minimize_scalar
 
         def objective(off: float) -> float:
@@ -347,15 +347,18 @@ def fit_f0_and_offset(
             f_p = f0_c * psi
             return float(np.sqrt(np.mean((observed_freqs - f_p) ** 2)))
 
-        res = minimize_scalar(objective, bracket=(bracket_min, best_offset, bracket_max), method="brent")
-        if res.fun < best_rms:
-            best_offset = float(res.x)
-            best_rms = float(res.fun)
-            obs_u = observed_times - best_offset
-            rr = np.interp(obs_u, t_arrival, range_rate)
-            psi = speed_of_sound / (speed_of_sound + rr)
-            denom = float(np.dot(psi, psi))
-            best_f0 = float(np.dot(observed_freqs, psi) / denom) if denom > 1e-12 else best_f0
-            best_f0 = float(np.clip(best_f0, f0_range[0], f0_range[1]))
+        try:
+            res = minimize_scalar(objective, bracket=(bracket_min, best_offset, bracket_max), method="brent")
+            if res.fun < best_rms:
+                best_offset = float(res.x)
+                best_rms = float(res.fun)
+                obs_u = observed_times - best_offset
+                rr = np.interp(obs_u, t_arrival, range_rate)
+                psi = speed_of_sound / (speed_of_sound + rr)
+                denom = float(np.dot(psi, psi))
+                best_f0 = float(np.dot(observed_freqs, psi) / denom) if denom > 1e-12 else best_f0
+                best_f0 = float(np.clip(best_f0, f0_range[0], f0_range[1]))
+        except Exception:
+            pass
 
     return float(best_f0), float(best_offset), float(best_rms)
