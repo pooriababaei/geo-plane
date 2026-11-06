@@ -426,7 +426,12 @@ class SpatialIndex:
         return results
 
 
-def parse_readsb_trace(data: dict, min_points: int = 5) -> FlightTrack | None:
+def parse_readsb_trace(
+    data: dict,
+    min_points: int = 5,
+    target_time: float | None = None,
+    window_s: float = 1800.0,
+) -> FlightTrack | None:
     """
     Parse a readsb / adsb.lol / tar1090 trace dictionary into a FlightTrack.
 
@@ -442,8 +447,6 @@ def parse_readsb_trace(data: dict, min_points: int = 5) -> FlightTrack | None:
         ]
       }
     """
-    import json
-
     icao = data.get("icao", data.get("hex", "unknown"))
     callsign = (data.get("flight") or data.get("r") or "").strip()
     base_t = float(data.get("timestamp", 0.0))
@@ -452,11 +455,27 @@ def parse_readsb_trace(data: dict, min_points: int = 5) -> FlightTrack | None:
     if len(raw_trace) < min_points:
         return None
 
+    # Fast time check on raw trace bounds if target_time is given
+    if target_time is not None:
+        try:
+            first_t = base_t + float(raw_trace[0][0])
+            last_t = base_t + float(raw_trace[-1][0])
+            if last_t < target_time - window_s or first_t > target_time + window_s:
+                return None
+        except (IndexError, ValueError, TypeError):
+            return None
+
     times, lats, lons, alts, vxs, vys, vzs = [], [], [], [], [], [], []
     for pt in raw_trace:
         if len(pt) < 3 or pt[1] is None or pt[2] is None:
             continue
         t_off = float(pt[0])
+        abs_t = base_t + t_off
+
+        # Filter strictly within the target time window to avoid interpolating 24h of data
+        if target_time is not None and abs(abs_t - target_time) > window_s:
+            continue
+
         lat = float(pt[1])
         lon = float(pt[2])
 
@@ -494,7 +513,7 @@ def parse_readsb_trace(data: dict, min_points: int = 5) -> FlightTrack | None:
         except (ValueError, TypeError):
             vz = 0.0
 
-        times.append(base_t + t_off)
+        times.append(abs_t)
         lats.append(lat)
         lons.append(lon)
         alts.append(alt_m)
@@ -529,7 +548,7 @@ def parse_readsb_trace(data: dict, min_points: int = 5) -> FlightTrack | None:
     vy_u = vys_arr[order][unique_idx]
     vz_u = vzs_arr[order][unique_idx]
 
-    # Interpolate to 1-second grid
+    # Interpolate to 1-second grid only for the window
     t_interp = np.arange(t_u[0], t_u[-1] + 1.0, 1.0)
     lat_interp = np.interp(t_interp, t_u, lat_u)
     lon_interp = np.interp(t_interp, t_u, lon_u)
@@ -572,7 +591,7 @@ def download_github_traces(
     date_dir.mkdir(parents=True, exist_ok=True)
 
     # Check if we already have tracks in cache for this date
-    cached_tracks = load_readsb_traces_dir(date_dir, bbox=bbox)
+    cached_tracks = load_readsb_traces_dir(date_dir, bbox=bbox, target_time=target_time)
     if cached_tracks:
         logger.info("Loaded %d cached GitHub archive tracks from %s", len(cached_tracks), date_dir)
         return cached_tracks
@@ -608,14 +627,18 @@ def download_github_traces(
 
     matched_tracks: list[FlightTrack] = []
 
-    # Stream download parts with progress bar and extract matching planes
+    # Stream download parts with clean single-line progress bar and extract matching planes
     with tempfile.NamedTemporaryFile(suffix=".tar") as temp_tar:
         with click.progressbar(
             length=total_download_bytes,
-            label="⬇️  Downloading & caching flight archive",
+            label="⬇️  Downloading archive",
+            width=30,
             show_percent=True,
             show_eta=True,
         ) as bar:
+            last_render_bytes = 0
+            # Update only every ~10 MB to prevent terminal scroll / newline spam
+            update_threshold = 10 * 1024 * 1024
             for asset in tar_assets:
                 download_url = asset.get("browser_download_url")
                 try:
@@ -623,58 +646,66 @@ def download_github_traces(
                     with urllib.request.urlopen(req_asset, timeout=120) as resp_asset:
                         while chunk := resp_asset.read(1024 * 1024):
                             temp_tar.write(chunk)
-                            bar.update(len(chunk))
+                            last_render_bytes += len(chunk)
+                            if last_render_bytes >= update_threshold:
+                                bar.update(last_render_bytes)
+                                last_render_bytes = 0
                 except Exception as exc:
                     logger.warning("Error streaming %s: %s", asset.get("name"), exc)
                     break
+            if last_render_bytes > 0:
+                bar.update(last_render_bytes)
 
         temp_tar.flush()
         temp_tar.seek(0)
 
-        # Open and scan tar archive
+        # Open and scan tar archive using generator iteration (O(1) memory)
         click.echo("🔎 Scanning and extracting regional flights for target airspace...")
         try:
             with tarfile.open(temp_tar.name, mode="r:*") as tar:
-                members = [m for m in tar.getmembers() if m.isfile() and m.name.endswith(".json")]
-                with click.progressbar(
-                    members,
-                    label="✈️  Extracting aircraft trajectories",
-                    show_percent=True,
-                ) as bar:
-                    for member in bar:
-                        f = tar.extractfile(member)
-                        if not f:
+                # Iterate sequentially over tar members rather than loading all into memory
+                processed_count = 0
+                for member in tar:
+                    if not member.isfile() or not member.name.endswith(".json"):
+                        continue
+                    processed_count += 1
+                    if processed_count % 5000 == 0:
+                        click.echo(f"   Scanned {processed_count:,} trajectories, matched {len(matched_tracks)} flights...")
+
+                    f = tar.extractfile(member)
+                    if not f:
+                        continue
+                    try:
+                        raw_bytes = f.read()
+                        if raw_bytes[:2] == b"\x1f\x8b":
+                            data = json.loads(gzip.decompress(raw_bytes))
+                        else:
+                            data = json.loads(raw_bytes)
+
+                        track = parse_readsb_trace(data, target_time=target_time)
+                        if track is None:
                             continue
-                        try:
-                            raw_bytes = f.read()
-                            if raw_bytes[:2] == b"\x1f\x8b":
-                                data = json.loads(gzip.decompress(raw_bytes))
-                            else:
-                                data = json.loads(raw_bytes)
 
-                            track = parse_readsb_trace(data)
-                            if track is None:
-                                continue
-
-                            # Check bounding box overlap
-                            lat_in = (track.lat >= bbox.min_lat) & (track.lat <= bbox.max_lat)
-                            lon_in = (track.lon >= bbox.min_lon) & (track.lon <= bbox.max_lon)
-                            if not np.any(lat_in & lon_in):
-                                continue
-
-                            # If target_time specified, verify time overlap
-                            if target_time is not None:
-                                if track.timestamps[-1] < target_time - 1800 or track.timestamps[0] > target_time + 1800:
-                                    continue
-
-                            # Save to cache
-                            dest_file = date_dir / f"trace_{track.icao24}.json"
-                            with open(dest_file, "w", encoding="utf-8") as out_fp:
-                                json.dump(data, out_fp)
-
-                            matched_tracks.append(track)
-                        except Exception:
+                        # Check bounding box overlap
+                        lat_in = (track.lat >= bbox.min_lat) & (track.lat <= bbox.max_lat)
+                        lon_in = (track.lon >= bbox.min_lon) & (track.lon <= bbox.max_lon)
+                        if not np.any(lat_in & lon_in):
                             continue
+
+                        # Save to cache
+                        dest_file = date_dir / f"trace_{track.icao24}.json"
+                        with open(dest_file, "w", encoding="utf-8") as out_fp:
+                            json.dump(data, out_fp)
+
+                        matched_tracks.append(track)
+                    except Exception:
+                        continue
+                    finally:
+                        del raw_bytes
+                        del data
+                        tar.members.clear()
+        except Exception as exc:
+            logger.warning("Error reading tarball stream: %s", exc)
         except Exception as exc:
             logger.warning("Error reading tarball stream: %s", exc)
 
@@ -685,11 +716,12 @@ def download_github_traces(
 def load_readsb_traces_dir(
     dir_path: str | Path,
     bbox: BoundingBox | None = None,
+    target_time: float | None = None,
 ) -> list[FlightTrack]:
     """
     Load readsb / tar1090 / adsb.lol JSON trace files from a directory.
 
-    Optionally filters by bounding box overlap.
+    Optionally filters by bounding box overlap and target time window.
     """
     import gzip
     import json
@@ -701,7 +733,7 @@ def load_readsb_traces_dir(
 
     tracks = []
     # Search for json and json.gz files
-    files = list(dir_path.glob("**/*.json")) + list(dir_path.glob("**/*.json.gz"))
+    files = list(dir_path.glob("*.json")) + list(dir_path.glob("*.json.gz"))
     logger.info("Scanning %d trace files in %s", len(files), dir_path)
 
     for f in files:
@@ -712,7 +744,18 @@ def load_readsb_traces_dir(
             else:
                 with open(f, "r", encoding="utf-8") as fp:
                     data = json.load(fp)
-            track = parse_readsb_trace(data)
+            if target_time is not None:
+                base_t = float(data.get("timestamp", 0.0))
+                raw_trace = data.get("trace", [])
+                if not raw_trace:
+                    continue
+                try:
+                    if (base_t + float(raw_trace[-1][0])) < target_time - 1800 or (base_t + float(raw_trace[0][0])) > target_time + 1800:
+                        continue
+                except (IndexError, ValueError, TypeError):
+                    continue
+
+            track = parse_readsb_trace(data, target_time=target_time)
             if track is None:
                 continue
 
@@ -726,6 +769,8 @@ def load_readsb_traces_dir(
             tracks.append(track)
         except Exception as exc:
             logger.debug("Error parsing %s: %s", f, exc)
+        finally:
+            del data
 
     logger.info("Loaded %d tracks from %s", len(tracks), dir_path)
     return tracks

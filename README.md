@@ -48,7 +48,7 @@ skyhear clip.mp4 --region "North America" --date 2026-06-07
 | Flag | Description |
 |------|-------------|
 | `<file>` or `--input`, `-i` | Input media file (mp4, mov, wav, ogg, m4a, mp3, etc.) |
-| `--region`, `-r` | Search region: city name (`"Vancouver"`), `"North America"`, or `center:lat,lon,radius_km:N` |
+| `--region`, `-r` | Search region: city name (`"Vancouver"`), continental (`"North America"`), or `center:lat,lon,radius_km:N` |
 | `--fresh` | Use live radar data for recordings made in the past hour (no date needed) |
 | `--date`, `-d` | Recording date (`YYYY-MM-DD`) for historical recordings |
 | `--opensky-user` | *(Optional)* OpenSky Network username (or `OPENSKY_USER` env var) |

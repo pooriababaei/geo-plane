@@ -63,27 +63,18 @@ KNOWN_METROS: dict[str, tuple[float, float, float]] = {
 }
 
 
-def _detect_local_metro() -> tuple[float, float, float, str]:
-    """Auto-detect user's approximate metro area via IP or fallback."""
-    import urllib.request
-    import json
-    try:
-        req = urllib.request.Request("http://ip-api.com/json/", headers={"User-Agent": "skyhear/0.1"})
-        with urllib.request.urlopen(req, timeout=3) as resp:
-            d = json.loads(resp.read().decode())
-            lat = float(d.get("lat", 49.25))
-            lon = float(d.get("lon", -123.12))
-            city = d.get("city", "Vancouver")
-            return lat, lon, 45.0, city
-    except Exception:
-        return 49.25, -123.12, 45.0, "Vancouver"
+def _geocode_name(name: str):
+    """
+    Geocode a place name into either a BoundingBox (for countries, states, regions)
+    or a (lat, lon, radius_km) tuple for cities and towns.
+    """
+    from .adsb import BoundingBox
 
-
-def _geocode_name(name: str) -> tuple[float, float, float] | None:
-    """Geocode a city or place name into (lat, lon, radius_km)."""
     norm = name.lower().strip()
     if norm in KNOWN_METROS:
-        return KNOWN_METROS[norm]
+        lat, lon, r_km = KNOWN_METROS[norm]
+        return BoundingBox.from_center_radius(lat, lon, r_km)
+
     import urllib.request
     import urllib.parse
     import json
@@ -94,9 +85,22 @@ def _geocode_name(name: str) -> tuple[float, float, float] | None:
         with urllib.request.urlopen(req, timeout=4) as resp:
             res = json.loads(resp.read().decode())
             if res and len(res) > 0:
-                lat = float(res[0]["lat"])
-                lon = float(res[0]["lon"])
-                return lat, lon, 45.0
+                item = res[0]
+                addresstype = item.get("addresstype", "")
+                raw_bbox = item.get("boundingbox", [])
+
+                # If it's a country, state, province, or large territory, use its TRUE geographic bounding box!
+                if addresstype in ("country", "state", "province", "region") and len(raw_bbox) == 4:
+                    min_lat = float(raw_bbox[0])
+                    max_lat = float(raw_bbox[1])
+                    min_lon = float(raw_bbox[2])
+                    max_lon = float(raw_bbox[3])
+                    return BoundingBox(min_lat=min_lat, max_lat=max_lat, min_lon=min_lon, max_lon=max_lon)
+
+                # For cities, towns, and specific places, center with a 45 km radius
+                lat = float(item["lat"])
+                lon = float(item["lon"])
+                return BoundingBox.from_center_radius(lat, lon, 45.0)
     except Exception:
         pass
     return None
@@ -107,10 +111,9 @@ def _parse_region(region_str: str, is_fresh: bool = False):
     Parse a region string into a BoundingBox.
 
     Formats:
-        - Plain English city name: "Vancouver", "Seattle", "Toronto"
-        - Continent / Auto: "North America", "auto", "local"
+        - Plain English city/area name: "Vancouver", "Seattle", "London"
         - Explicit bbox: "bbox:min_lat,min_lon,max_lat,max_lon"
-        - Explicit center: "center:lat,lon,radius_km:300"
+        - Explicit center: "center:lat,lon,radius_km:50"
     """
     from .adsb import BoundingBox
 
@@ -130,11 +133,11 @@ def _parse_region(region_str: str, is_fresh: bool = False):
         parts = rest.split(",")
         if len(parts) < 2:
             raise click.BadParameter(
-                "center format: center:lat,lon,radius_km:300"
+                "center format: center:lat,lon,radius_km:50"
             )
         lat = float(parts[0])
         lon_and_radius = parts[1:]
-        radius_km = 100.0
+        radius_km = 45.0
         lon_str = lon_and_radius[0]
         for part in lon_and_radius:
             if part.startswith("radius_km:"):
@@ -144,23 +147,25 @@ def _parse_region(region_str: str, is_fresh: bool = False):
         lon = float(lon_str)
         return BoundingBox.from_center_radius(lat, lon, radius_km)
 
-    # Broad regions / auto / local
-    if norm in ("north america", "na", "auto", "local", "here", "default"):
-        lat, lon, r_km, name = _detect_local_metro()
-        click.echo(f"🌐 Resolved region '{region_str}' to local airspace: {name} ({lat:.4f}, {lon:.4f}, radius {r_km:.0f}km)")
-        return BoundingBox.from_center_radius(lat, lon, r_km)
+    # Continental North America
+    if norm in ("north america", "north-america", "na"):
+        click.echo("🌎 Searching across continental North America (14.5°N–71.5°N, 168.0°W–52.0°W)...")
+        return BoundingBox(min_lat=14.5, max_lat=71.5, min_lon=-168.0, max_lon=-52.0)
 
-    # Named city or area lookup
-    coords = _geocode_name(region_str)
-    if coords is not None:
-        lat, lon, r_km = coords
-        click.echo(f"📍 Resolved region '{region_str}' to ({lat:.4f}, {lon:.4f}, radius {r_km:.0f}km)")
-        return BoundingBox.from_center_radius(lat, lon, r_km)
+    # Named country, state, city, or area lookup via OpenStreetMap Nominatim
+    resolved_bbox = _geocode_name(region_str)
+    if resolved_bbox is not None:
+        click.echo(
+            f"📍 Resolved region '{region_str}' to "
+            f"({resolved_bbox.min_lat:.2f}°N–{resolved_bbox.max_lat:.2f}°N, "
+            f"{resolved_bbox.min_lon:.2f}°W–{resolved_bbox.max_lon:.2f}°W)"
+        )
+        return resolved_bbox
 
     raise click.BadParameter(
         f"Could not resolve region '{region_str}'. "
-        "Use a city name ('Vancouver', 'Seattle'), 'North America', bbox:min_lat,min_lon,max_lat,max_lon, "
-        "or center:lat,lon,radius_km:N"
+        "Please provide a specific city or area name (e.g. 'Vancouver', 'Seattle'), 'North America', "
+        "bbox:min_lat,min_lon,max_lat,max_lon, or center:lat,lon,radius_km:N"
     )
 
 
@@ -187,7 +192,7 @@ def _parse_region(region_str: str, is_fresh: bool = False):
 @click.option(
     "--region", "-r",
     default=None,
-    help="Search region: city name (e.g. 'Vancouver'), 'North America', bbox:..., or center:lat,lon,radius_km:N",
+    help="Search region: city name (e.g. 'Vancouver', 'Seattle'), bbox:..., or center:lat,lon,radius_km:N",
 )
 @click.option(
     "--top", "-n",
@@ -295,28 +300,51 @@ def main(
             "Example: geo-locate clip.ogg --region Vancouver --fresh"
         )
 
-    if fresh:
+    # Inspect media file for embedded creation_time
+    file_utc_datetime = None
+    try:
+        import av
+        container = av.open(str(input_file))
+        ct = container.metadata.get("creation_time")
+        if ct:
+            file_utc_datetime = datetime.fromisoformat(ct.replace("Z", "+00:00"))
+    except Exception:
+        pass
+
+    # If the user did not specify --date or --fresh, auto-extract from file
+    if not date and not fresh:
+        if file_utc_datetime is not None:
+            date = file_utc_datetime.strftime("%Y-%m-%d")
+            click.echo(f"📅 Auto-detected recording date: {date} (from file)")
+        else:
+            raise click.UsageError(
+                "Could not find embedded recording date in media metadata.\n"
+                "Please provide --date YYYY-MM-DD or use --fresh if recorded just now."
+            )
+    elif fresh:
         if not date:
             date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
             click.echo(f"⚡ Fresh mode: auto-selected today's date ({date})")
-    elif not date:
-        raise click.UsageError(
-            "Missing required option '--date' / '-d' (e.g. --date 2026-06-07).\n"
-            "If the recording was made in the past hour, simply add '--fresh'."
-        )
 
     if not region:
-        if fresh:
-            region = "auto"
-        else:
-            raise click.UsageError(
-                "Missing required option '--region' / '-r' (e.g. --region 'Vancouver')."
-            )
+        raise click.UsageError(
+            "Missing required option '--region' / '-r' (e.g. --region 'Vancouver')."
+        )
 
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
 
     bbox = _parse_region(region, is_fresh=fresh)
+
+    # Convert user local date & time to true UTC using the target region's timezone
+    center_lat = (bbox.min_lat + bbox.max_lat) / 2.0
+    center_lon = (bbox.min_lon + bbox.max_lon) / 2.0
+    from timezonefinder import TimezoneFinder
+    import zoneinfo
+
+    tf = TimezoneFinder()
+    tz_name = tf.timezone_at(lat=center_lat, lng=center_lon) or "UTC"
+    region_tz = zoneinfo.ZoneInfo(tz_name)
 
     # === Step 1: Ingest ===
     ingest_result = extract_audio(input_file, output_dir=output_path / "audio")
@@ -350,13 +378,16 @@ def main(
     # === Step 3: Determine recording time ===
     recording_utc_start = None
     if start_time:
+        # Interpret user-provided start_time & date in region's local timezone, convert to UTC
         try:
-            dt = datetime.strptime(f"{date} {start_time}", "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
-            recording_utc_start = dt.timestamp()
+            dt_local = datetime.strptime(f"{date} {start_time}", "%Y-%m-%d %H:%M:%S").replace(tzinfo=region_tz)
         except ValueError:
-            dt = datetime.strptime(f"{date} {start_time}", "%Y-%m-%d %H:%M").replace(tzinfo=timezone.utc)
-            recording_utc_start = dt.timestamp()
-        click.echo(f"⏱️  Time: {start_time} UTC")
+            dt_local = datetime.strptime(f"{date} {start_time}", "%Y-%m-%d %H:%M").replace(tzinfo=region_tz)
+        dt_utc = dt_local.astimezone(zoneinfo.ZoneInfo("UTC"))
+        recording_utc_start = dt_utc.timestamp()
+        # Update date to true UTC date for archive retrieval
+        date = dt_utc.strftime("%Y-%m-%d")
+        click.echo(f"⏱️  Time: {dt_local.strftime('%H:%M:%S')} ({tz_name}) → {dt_utc.strftime('%H:%M:%S UTC')}")
     elif fresh:
         file_mtime = os.path.getmtime(input_file)
         now_ts = datetime.now(timezone.utc).timestamp()
@@ -369,19 +400,18 @@ def main(
             rec_dt = datetime.fromtimestamp(recording_utc_start, tz=timezone.utc)
             click.echo(f"⏱️  Time: ~{rec_dt.strftime('%H:%M:%S UTC')} (live)")
     else:
-        try:
-            import av
-            container = av.open(str(input_file))
-            ct = container.metadata.get("creation_time")
-            if ct:
-                dt = datetime.fromisoformat(ct.replace("Z", "+00:00"))
-                recording_utc_start = dt.timestamp()
-                # Differentiate video vs audio container recording metadata
-                is_video = any(s.type == "video" for s in container.streams)
-                source_label = "video recording metadata" if is_video else "audio recording metadata"
-                click.echo(f"⏱️  Time: {dt.strftime('%H:%M:%S UTC')} ({source_label})")
-        except Exception:
-            pass
+        if file_utc_datetime is not None:
+            recording_utc_start = file_utc_datetime.timestamp()
+            # The container creation_time is already strictly in UTC!
+            # Align archive date with true UTC date from file
+            date = file_utc_datetime.strftime("%Y-%m-%d")
+            local_dt = file_utc_datetime.astimezone(region_tz)
+            is_video = any(s.type == "video" for s in container.streams)
+            source_label = "video" if is_video else "audio"
+            click.echo(
+                f"⏱️  Time: {file_utc_datetime.strftime('%H:%M:%S UTC')} "
+                f"({local_dt.strftime('%H:%M:%S')} {tz_name}) from {source_label} metadata"
+            )
 
     # === Step 4: Fetch ADS-B data ===
     today_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -404,7 +434,7 @@ def main(
         click.echo(f"✈️  Retrieving historical flight paths for {date}...")
         tracks = download_github_traces(date, bbox=bbox, target_time=recording_utc_start)
 
-        # 2. Fall back to OpenSky Network if GitHub archive not yet published
+        # 2. Fall back to OpenSky Network only if GitHub archive not yet published
         if not tracks:
             try:
                 df = fetch_opensky_tracks(
@@ -417,15 +447,10 @@ def main(
             except Exception:
                 pass
 
-        # 3. Final fallback to live radar feeds
+        # If historical search finds 0 flights, NEVER fall back to live feeds
         if not tracks:
-            from .adsb import fetch_live_tracks
-            tracks = fetch_live_tracks(
-                bbox=bbox,
-                target_time=recording_utc_start,
-                username=opensky_user,
-                password=opensky_pass,
-            )
+            click.echo(f"⚠️  No flight tracks found for {date} in the target airspace.")
+            sys.exit(1)
 
     if not tracks:
         click.echo("⚠️  No matching flight tracks found.")

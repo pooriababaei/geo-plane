@@ -191,12 +191,11 @@ class TestCliRegionParsing:
         assert bbox.min_lat < 49.25 < bbox.max_lat
         assert bbox.min_lon < -123.12 < bbox.max_lon
 
-    def test_north_america_auto(self):
+    def test_north_america_full_continent(self):
         from skyhear.cli import _parse_region
 
-        bbox = _parse_region("North America", is_fresh=True)
-        assert bbox is not None
-        assert bbox.min_lat < bbox.max_lat
-        assert bbox.min_lon < bbox.max_lon
+        bbox = _parse_region("North America")
+        assert bbox.min_lat == 14.5 and bbox.max_lat == 71.5
+        assert bbox.min_lon == -168.0 and bbox.max_lon == -52.0
 
 

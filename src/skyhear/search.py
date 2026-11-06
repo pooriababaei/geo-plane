@@ -183,8 +183,51 @@ def _score_single_point(args: tuple) -> CandidateLocation | None:
     )
 
 
-def _generate_grid(bbox: BoundingBox, step_deg: float) -> list[tuple[float, float]]:
-    """Generate a grid of (lat, lon) points within a bounding box."""
+def _generate_grid(
+    bbox: BoundingBox,
+    step_deg: float,
+    tracks_data: list[dict] | None = None,
+    max_dist_km: float = 50.0,
+) -> list[tuple[float, float]]:
+    """
+    Generate candidate (lat, lon) grid points within a bounding box.
+    If tracks_data is provided, restricts candidate search points to the audible
+    corridors (within max_dist_km) of actual candidate flight tracks.
+    """
+    if tracks_data:
+        max_dist_deg = max(0.2, max_dist_km / 111.0)
+        track_pts = []
+        for t in tracks_data:
+            lats = t["lat"]
+            lons = t["lon"]
+            step = max(1, len(lats) // 30)
+            for lat, lon in zip(lats[::step], lons[::step]):
+                if (
+                    bbox.min_lat - max_dist_deg <= lat <= bbox.max_lat + max_dist_deg
+                    and bbox.min_lon - max_dist_deg <= lon <= bbox.max_lon + max_dist_deg
+                ):
+                    track_pts.append((lat, lon))
+
+        if track_pts:
+            occupied_cells = set(
+                (round(lat / step_deg) * step_deg, round(lon / step_deg) * step_deg)
+                for lat, lon in track_pts
+            )
+            expand_cells = max(1, int(np.ceil(max_dist_deg / step_deg)))
+            corridor_cells = set()
+            for clat, clon in occupied_cells:
+                for di in range(-expand_cells, expand_cells + 1):
+                    for dj in range(-expand_cells, expand_cells + 1):
+                        pt_lat = round(clat + di * step_deg, 4)
+                        pt_lon = round(clon + dj * step_deg, 4)
+                        if (
+                            bbox.min_lat <= pt_lat <= bbox.max_lat
+                            and bbox.min_lon <= pt_lon <= bbox.max_lon
+                        ):
+                            corridor_cells.add((pt_lat, pt_lon))
+            if corridor_cells:
+                return sorted(corridor_cells)
+
     lats = np.arange(bbox.min_lat, bbox.max_lat + step_deg, step_deg)
     lons = np.arange(bbox.min_lon, bbox.max_lon + step_deg, step_deg)
     grid = [(float(lat), float(lon)) for lat in lats for lon in lons]
@@ -311,9 +354,7 @@ def search_location(
         t_max_all = float("inf")
 
     # Filter and prepare flight tracks: only airborne tracks in the region during the window
-    center_lat = (bbox.min_lat + bbox.max_lat) / 2.0
-    center_lon = (bbox.min_lon + bbox.max_lon) / 2.0
-    max_search_dist_m = (config.max_slant_range_km + 20.0) * 1000.0
+    margin_deg = (config.max_slant_range_km + 10.0) / 111.0
 
     tracks_data = []
     for t in tracks:
@@ -323,24 +364,38 @@ def search_location(
                 continue
             if np.max(t.alt_m[mask]) < 100:
                 continue
-            slant = compute_slant_range(center_lat, center_lon, 0.0, t.lat[mask], t.lon[mask], t.alt_m[mask])
-            if np.min(slant) > max_search_dist_m:
+            in_bbox = (
+                (t.lat[mask] >= bbox.min_lat - margin_deg)
+                & (t.lat[mask] <= bbox.max_lat + margin_deg)
+                & (t.lon[mask] >= bbox.min_lon - margin_deg)
+                & (t.lon[mask] <= bbox.max_lon + margin_deg)
+            )
+            if not np.any(in_bbox):
                 continue
 
-        tracks_data.append({
-            "icao24": t.icao24,
-            "callsign": t.callsign,
-            "timestamps": t.timestamps,
-            "lat": t.lat,
-            "lon": t.lon,
-            "alt_m": t.alt_m,
-        })
+            tracks_data.append({
+                "icao24": t.icao24,
+                "callsign": t.callsign,
+                "timestamps": t.timestamps[mask],
+                "lat": t.lat[mask],
+                "lon": t.lon[mask],
+                "alt_m": t.alt_m[mask],
+            })
+        else:
+            tracks_data.append({
+                "icao24": t.icao24,
+                "callsign": t.callsign,
+                "timestamps": t.timestamps,
+                "lat": t.lat,
+                "lon": t.lon,
+                "alt_m": t.alt_m,
+            })
 
     logger.info("Search space: %d relevant flight tracks over %s", len(tracks_data), bbox)
 
-    # === Phase 1: Coarse grid ===
+    # === Phase 1: Coarse grid (audible flight corridors) ===
     candidates = _search_grid(
-        bbox, config.coarse_grid_deg, passes_data, tracks_data, config, n_workers
+        bbox, config.coarse_grid_deg, passes_data, tracks_data, config, n_workers, use_corridors=True
     )
     candidates.sort(key=lambda c: c.total_score)
     top_coarse = candidates[: config.top_k_coarse]
@@ -356,7 +411,7 @@ def search_location(
     for c in top_coarse:
         refined_bbox = _refine_bbox(c.lat, c.lon, config.coarse_grid_deg / 2)
         results = _search_grid(
-            refined_bbox, config.medium_grid_deg, passes_data, tracks_data, config, n_workers
+            refined_bbox, config.medium_grid_deg, passes_data, tracks_data, config, n_workers, use_corridors=False
         )
         medium_candidates.extend(results)
 
@@ -374,7 +429,7 @@ def search_location(
     for c in top_medium:
         refined_bbox = _refine_bbox(c.lat, c.lon, config.medium_grid_deg / 2)
         results = _search_grid(
-            refined_bbox, config.fine_grid_deg, passes_data, tracks_data, config, n_workers
+            refined_bbox, config.fine_grid_deg, passes_data, tracks_data, config, n_workers, use_corridors=False
         )
         fine_candidates.extend(results)
 
@@ -397,9 +452,15 @@ def _search_grid(
     tracks_data: list[dict],
     config: SearchConfig,
     n_workers: int,
+    use_corridors: bool = False,
 ) -> list[CandidateLocation]:
     """Score all grid points in a bounding box."""
-    grid = _generate_grid(bbox, step_deg)
+    grid = _generate_grid(
+        bbox,
+        step_deg,
+        tracks_data=tracks_data if use_corridors else None,
+        max_dist_km=config.max_slant_range_km + 10.0,
+    )
 
     if not grid:
         return []
