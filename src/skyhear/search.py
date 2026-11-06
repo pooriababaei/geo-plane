@@ -54,9 +54,9 @@ class SearchConfig:
     """Configuration for the location search."""
 
     # Grid resolutions for coarse-to-fine search (degrees)
-    coarse_grid_deg: float = 0.05     # ~5 km
-    medium_grid_deg: float = 0.01     # ~1 km
-    fine_grid_deg: float = 0.001      # ~100 m
+    coarse_grid_deg: float = 0.01     # ~1 km
+    medium_grid_deg: float = 0.002    # ~200 m
+    fine_grid_deg: float = 0.0005     # ~50 m
 
     # How many top candidates to refine at each level
     top_k_coarse: int = 5
@@ -64,7 +64,7 @@ class SearchConfig:
     top_k_fine: int = 5
 
     # Search parameters
-    max_slant_range_km: float = 40.0
+    max_slant_range_km: float = 35.0
     max_clock_offset_s: float = 180.0
 
     # Scoring weights
@@ -149,7 +149,7 @@ def _score_single_point(args: tuple) -> CandidateLocation | None:
                     rms_residual_hz=rms,
                 )
 
-        if best_match is not None:
+        if best_match is not None and best_match.rms_residual_hz < 30.0:
             flight_matches.append(best_match)
             total_residual += best_match.rms_residual_hz
         else:

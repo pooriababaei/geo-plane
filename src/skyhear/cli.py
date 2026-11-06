@@ -97,10 +97,10 @@ def _geocode_name(name: str):
                     max_lon = float(raw_bbox[3])
                     return BoundingBox(min_lat=min_lat, max_lat=max_lat, min_lon=min_lon, max_lon=max_lon)
 
-                # For cities, towns, and specific places, center with a 45 km radius
+                # For cities, towns, and specific places, center with a 25 km radius
                 lat = float(item["lat"])
                 lon = float(item["lon"])
-                return BoundingBox.from_center_radius(lat, lon, 45.0)
+                return BoundingBox.from_center_radius(lat, lon, 25.0)
     except Exception:
         pass
     return None
@@ -221,7 +221,7 @@ def _parse_region(region_str: str, is_fresh: bool = False):
 )
 @click.option(
     "--min-duration",
-    default=8.0,
+    default=10.0,
     show_default=True,
     help="Minimum ridge duration in seconds for Doppler pass detection",
 )
@@ -460,7 +460,9 @@ def main(
 
     # === Step 5: Search ===
     click.echo("🎯 Geolocating...")
-    config = SearchConfig()
+    config = SearchConfig(
+        max_clock_offset_s=10.0 if recording_utc_start is not None else 180.0,
+    )
     candidates = search_location(
         passes, tracks, bbox, config, recording_utc_start=recording_utc_start
     )
