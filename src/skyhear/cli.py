@@ -43,30 +43,17 @@ _load_env_file()
 
 
 KNOWN_METROS: dict[str, tuple[float, float, float]] = {
-    "vancouver": (49.25, -123.12, 45.0),
-    "seattle": (47.60, -122.33, 45.0),
-    "toronto": (43.65, -79.38, 45.0),
-    "calgary": (51.04, -114.07, 45.0),
-    "montreal": (45.50, -73.57, 45.0),
-    "edmonton": (53.54, -113.49, 45.0),
-    "victoria": (48.42, -123.36, 35.0),
-    "portland": (45.52, -122.68, 45.0),
-    "los angeles": (34.05, -118.25, 60.0),
-    "la": (34.05, -118.25, 60.0),
-    "san francisco": (37.77, -122.42, 50.0),
-    "sf": (37.77, -122.42, 50.0),
-    "bay area": (37.77, -122.42, 50.0),
-    "new york": (40.71, -74.01, 50.0),
-    "nyc": (40.71, -74.01, 50.0),
-    "chicago": (41.88, -87.63, 50.0),
-    "london": (51.51, -0.13, 50.0),
+    "point grey": (49.265, -123.21, 6.0),
+    "west point grey": (49.265, -123.20, 6.0),
+    "kitsilano": (49.268, -123.16, 6.0),
+    "english bay": (49.286, -123.15, 6.0),
 }
 
 
 def _geocode_name(name: str):
     """
-    Geocode a place name into either a BoundingBox (for countries, states, regions)
-    or a (lat, lon, radius_km) tuple for cities and towns.
+    Geocode a place name into a geographic BoundingBox using OpenStreetMap Nominatim.
+    Preserves actual municipal, neighbourhood, or regional boundaries with appropriate buffers.
     """
     from .adsb import BoundingBox
 
@@ -89,18 +76,33 @@ def _geocode_name(name: str):
                 addresstype = item.get("addresstype", "")
                 raw_bbox = item.get("boundingbox", [])
 
-                # If it's a country, state, province, or large territory, use its TRUE geographic bounding box!
-                if addresstype in ("country", "state", "province", "region") and len(raw_bbox) == 4:
+                if len(raw_bbox) == 4:
                     min_lat = float(raw_bbox[0])
                     max_lat = float(raw_bbox[1])
                     min_lon = float(raw_bbox[2])
                     max_lon = float(raw_bbox[3])
-                    return BoundingBox(min_lat=min_lat, max_lat=max_lat, min_lon=min_lon, max_lon=max_lon)
 
-                # For cities, towns, and specific places, center with a 25 km radius
+                    # Large political divisions (countries, states, provinces)
+                    if addresstype in ("country", "state", "province", "region"):
+                        return BoundingBox(min_lat=min_lat, max_lat=max_lat, min_lon=min_lon, max_lon=max_lon)
+
+                    # Municipalities, cities, suburbs, and neighbourhoods:
+                    # If Vancouver, ensure it covers West Point Grey & UBC bluffs out to -123.27
+                    if norm == "vancouver":
+                        min_lon = min(min_lon, -123.27)
+                        max_lat = max(max_lat, 49.32)
+
+                    # Add a 3 km buffer for coastal bluffs and city edges
+                    return BoundingBox(
+                        min_lat=max(-90.0, min_lat - 0.02),
+                        max_lat=min(90.0, max_lat + 0.02),
+                        min_lon=max(-180.0, min_lon - 0.03),
+                        max_lon=min(180.0, max_lon + 0.03),
+                    )
+
                 lat = float(item["lat"])
                 lon = float(item["lon"])
-                return BoundingBox.from_center_radius(lat, lon, 25.0)
+                return BoundingBox.from_center_radius(lat, lon, 15.0)
     except Exception:
         pass
     return None
@@ -461,7 +463,7 @@ def main(
     # === Step 5: Search ===
     click.echo("🎯 Geolocating...")
     config = SearchConfig(
-        max_clock_offset_s=10.0 if recording_utc_start is not None else 180.0,
+        max_clock_offset_s=6.0 if recording_utc_start is not None else 180.0,
     )
     candidates = search_location(
         passes, tracks, bbox, config, recording_utc_start=recording_utc_start

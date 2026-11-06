@@ -686,9 +686,10 @@ def download_github_traces(
                         if track is None:
                             continue
 
-                        # Check bounding box overlap
-                        lat_in = (track.lat >= bbox.min_lat) & (track.lat <= bbox.max_lat)
-                        lon_in = (track.lon >= bbox.min_lon) & (track.lon <= bbox.max_lon)
+                        # Check bounding box overlap (with acoustic horizon buffer)
+                        margin_deg = 0.45
+                        lat_in = (track.lat >= bbox.min_lat - margin_deg) & (track.lat <= bbox.max_lat + margin_deg)
+                        lon_in = (track.lon >= bbox.min_lon - margin_deg) & (track.lon <= bbox.max_lon + margin_deg)
                         if not np.any(lat_in & lon_in):
                             continue
 
@@ -759,10 +760,11 @@ def load_readsb_traces_dir(
             if track is None:
                 continue
 
-            # Optional bbox check
+            # Optional bbox check (expanded with acoustic horizon buffer)
             if bbox is not None:
-                lat_in = (track.lat >= bbox.min_lat) & (track.lat <= bbox.max_lat)
-                lon_in = (track.lon >= bbox.min_lon) & (track.lon <= bbox.max_lon)
+                margin_deg = 0.45
+                lat_in = (track.lat >= bbox.min_lat - margin_deg) & (track.lat <= bbox.max_lat + margin_deg)
+                lon_in = (track.lon >= bbox.min_lon - margin_deg) & (track.lon <= bbox.max_lon + margin_deg)
                 if not np.any(lat_in & lon_in):
                     continue
 

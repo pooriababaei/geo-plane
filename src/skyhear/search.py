@@ -64,7 +64,7 @@ class SearchConfig:
     top_k_fine: int = 5
 
     # Search parameters
-    max_slant_range_km: float = 35.0
+    max_slant_range_km: float = 45.0
     max_clock_offset_s: float = 180.0
 
     # Scoring weights
@@ -136,7 +136,7 @@ def _score_single_point(args: tuple) -> CandidateLocation | None:
             except Exception:
                 continue
 
-            if abs(offset) > max_clock_offset_s:
+            if abs(abs(offset) - max_clock_offset_s) < 0.05 or abs(offset) > max_clock_offset_s:
                 continue
 
             if rms < best_rms:
@@ -149,7 +149,7 @@ def _score_single_point(args: tuple) -> CandidateLocation | None:
                     rms_residual_hz=rms,
                 )
 
-        if best_match is not None and best_match.rms_residual_hz < 30.0:
+        if best_match is not None and best_match.rms_residual_hz < 40.0:
             flight_matches.append(best_match)
             total_residual += best_match.rms_residual_hz
         else:
@@ -157,15 +157,14 @@ def _score_single_point(args: tuple) -> CandidateLocation | None:
             total_residual += unexplained_pass_penalty
 
     # Clock offset consistency check:
-    # All aircraft heard in the SAME recording MUST share the same physical clock offset!
-    # Contradictory offsets (e.g. Flight A at -50s, Flight B at +50s) are physically impossible.
+    # All aircraft heard in the SAME recording share physical clock offset within transponder jitter (~10-12s)
     if len(flight_matches) >= 2:
-        good_offsets = [m.fitted_offset for m in flight_matches if m.rms_residual_hz < 30.0]
+        good_offsets = [m.fitted_offset for m in flight_matches if m.rms_residual_hz < 40.0]
         if len(good_offsets) >= 2:
             offset_spread = max(good_offsets) - min(good_offsets)
-            if offset_spread > 5.0:
+            if offset_spread > 12.0:
                 # Strong penalty for temporal inconsistency in the same audio recording
-                total_residual += 20.0 * (offset_spread - 5.0)
+                total_residual += 20.0 * (offset_spread - 12.0)
 
     # Negative evidence: check for flights that should be audible but weren't detected
     # (simplified — full implementation would check all nearby flights)
@@ -192,41 +191,48 @@ def _generate_grid(
     """
     Generate candidate (lat, lon) grid points within a bounding box.
     If tracks_data is provided, restricts candidate search points to the audible
-    corridors (within max_dist_km) of actual candidate flight tracks.
+    corridors (within max_dist_km) where flights are actually overhead.
     """
     if tracks_data:
+        from collections import defaultdict
+
         max_dist_deg = max(0.2, max_dist_km / 111.0)
-        track_pts = []
+        expand_cells = max(1, int(np.ceil(max_dist_deg / step_deg)))
+        cell_flight_count: dict[tuple[float, float], int] = defaultdict(int)
+
         for t in tracks_data:
             lats = t["lat"]
             lons = t["lon"]
-            step = max(1, len(lats) // 30)
+            step = max(1, len(lats) // 15)
+            plane_cells = set()
             for lat, lon in zip(lats[::step], lons[::step]):
                 if (
                     bbox.min_lat - max_dist_deg <= lat <= bbox.max_lat + max_dist_deg
                     and bbox.min_lon - max_dist_deg <= lon <= bbox.max_lon + max_dist_deg
                 ):
-                    track_pts.append((lat, lon))
+                    clat = round(lat / step_deg) * step_deg
+                    clon = round(lon / step_deg) * step_deg
+                    for di in range(-expand_cells, expand_cells + 1):
+                        for dj in range(-expand_cells, expand_cells + 1):
+                            pt_lat = round(clat + di * step_deg, 4)
+                            pt_lon = round(clon + dj * step_deg, 4)
+                            if (
+                                bbox.min_lat <= pt_lat <= bbox.max_lat
+                                and bbox.min_lon <= pt_lon <= bbox.max_lon
+                            ):
+                                plane_cells.add((pt_lat, pt_lon))
+            for pt in plane_cells:
+                cell_flight_count[pt] += 1
 
-        if track_pts:
-            occupied_cells = set(
-                (round(lat / step_deg) * step_deg, round(lon / step_deg) * step_deg)
-                for lat, lon in track_pts
-            )
-            expand_cells = max(1, int(np.ceil(max_dist_deg / step_deg)))
-            corridor_cells = set()
-            for clat, clon in occupied_cells:
-                for di in range(-expand_cells, expand_cells + 1):
-                    for dj in range(-expand_cells, expand_cells + 1):
-                        pt_lat = round(clat + di * step_deg, 4)
-                        pt_lon = round(clon + dj * step_deg, 4)
-                        if (
-                            bbox.min_lat <= pt_lat <= bbox.max_lat
-                            and bbox.min_lon <= pt_lon <= bbox.max_lon
-                        ):
-                            corridor_cells.add((pt_lat, pt_lon))
-            if corridor_cells:
-                return sorted(corridor_cells)
+        if cell_flight_count:
+            lat_span = bbox.max_lat - bbox.min_lat
+            # For country-scale searches, require candidate points to be in range
+            # of multiple crossing flights to eliminate single-flight empty wilderness
+            min_flights = 2 if (lat_span > 2.0 and len(tracks_data) >= 3) else 1
+            corridor_cells = [pt for pt, count in cell_flight_count.items() if count >= min_flights]
+            if not corridor_cells:
+                corridor_cells = list(cell_flight_count.keys())
+            return sorted(corridor_cells)
 
     lats = np.arange(bbox.min_lat, bbox.max_lat + step_deg, step_deg)
     lons = np.arange(bbox.min_lon, bbox.max_lon + step_deg, step_deg)
@@ -345,10 +351,11 @@ def search_location(
             "t_closest_approach": t_base + p.t_closest_approach,
         })
 
-    # Time bounds across all passes
+    # Time bounds across all passes, including acoustic propagation delay (slant_range / c)
+    prop_delay_s = (config.max_slant_range_km * 1000.0 / 343.0) + config.max_clock_offset_s + 30.0
     if passes_data:
-        t_min_all = min(p["times"][0] for p in passes_data) - config.max_clock_offset_s
-        t_max_all = max(p["times"][-1] for p in passes_data) + config.max_clock_offset_s
+        t_min_all = min(p["times"][0] for p in passes_data) - prop_delay_s
+        t_max_all = max(p["times"][-1] for p in passes_data) + prop_delay_s
     else:
         t_min_all = -float("inf")
         t_max_all = float("inf")
@@ -393,9 +400,22 @@ def search_location(
 
     logger.info("Search space: %d relevant flight tracks over %s", len(tracks_data), bbox)
 
+    # Adaptive multi-scale resolution based on bounding box geographic extent
+    lat_span = bbox.max_lat - bbox.min_lat
+    if lat_span > 2.0:
+        # Regional / Country / Continental scale (e.g. Canada, US, Province)
+        coarse_step = max(config.coarse_grid_deg, 0.05)
+        medium_step = max(config.medium_grid_deg, 0.005)
+        fine_step = config.fine_grid_deg
+    else:
+        # City / Metropolitan scale (e.g. Vancouver, Point Grey)
+        coarse_step = config.coarse_grid_deg
+        medium_step = config.medium_grid_deg
+        fine_step = config.fine_grid_deg
+
     # === Phase 1: Coarse grid (audible flight corridors) ===
     candidates = _search_grid(
-        bbox, config.coarse_grid_deg, passes_data, tracks_data, config, n_workers, use_corridors=True
+        bbox, coarse_step, passes_data, tracks_data, config, n_workers, use_corridors=True
     )
     candidates.sort(key=lambda c: c.total_score)
     top_coarse = candidates[: config.top_k_coarse]
@@ -409,9 +429,9 @@ def search_location(
     # === Phase 2: Medium grid around top coarse candidates ===
     medium_candidates = []
     for c in top_coarse:
-        refined_bbox = _refine_bbox(c.lat, c.lon, config.coarse_grid_deg / 2)
+        refined_bbox = _refine_bbox(c.lat, c.lon, coarse_step / 2)
         results = _search_grid(
-            refined_bbox, config.medium_grid_deg, passes_data, tracks_data, config, n_workers, use_corridors=False
+            refined_bbox, medium_step, passes_data, tracks_data, config, n_workers, use_corridors=False
         )
         medium_candidates.extend(results)
 
@@ -427,9 +447,9 @@ def search_location(
     # === Phase 3: Fine grid around top medium candidates ===
     fine_candidates = []
     for c in top_medium:
-        refined_bbox = _refine_bbox(c.lat, c.lon, config.medium_grid_deg / 2)
+        refined_bbox = _refine_bbox(c.lat, c.lon, medium_step / 2)
         results = _search_grid(
-            refined_bbox, config.fine_grid_deg, passes_data, tracks_data, config, n_workers, use_corridors=False
+            refined_bbox, fine_step, passes_data, tracks_data, config, n_workers, use_corridors=False
         )
         fine_candidates.extend(results)
 

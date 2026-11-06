@@ -199,21 +199,24 @@ def calculate_confidence(candidate: CandidateLocation) -> int:
     
     # Residual factor (lower residual = higher confidence)
     avg_rms = sum(m.rms_residual_hz for m in candidate.flight_matches) / n_matches
-    # 0 Hz -> 1.0, 10 Hz -> 0.7, 20 Hz -> 0.3, >30 Hz -> 0.0
-    rms_factor = max(0.0, 1.0 - (avg_rms / 30.0))
+    # 0 Hz -> 1.0, 15 Hz -> 0.625, 30 Hz -> 0.25, >=40 Hz -> 0.0
+    rms_factor = max(0.0, 1.0 - (avg_rms / 40.0))
 
     # Multi-plane multilateration bonus:
     # 1 plane = max 55% (corridor ambiguity)
-    # 2 planes = up to 85%
-    # 3+ planes = up to 98%
+    # 2 planes = up to 80%
+    # 3 planes = up to 90%
+    # 4+ planes = up to 98%
     if n_matches == 1:
         max_possible = 55.0
     elif n_matches == 2:
-        max_possible = 85.0
+        max_possible = 80.0
+    elif n_matches == 3:
+        max_possible = 90.0
     else:
         max_possible = 98.0
 
-    score = max_possible * match_ratio * (0.6 + 0.4 * rms_factor)
+    score = max_possible * (match_ratio ** 1.2) * (0.6 + 0.4 * rms_factor)
     return int(max(0, min(99, round(score))))
 
 
