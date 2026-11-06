@@ -1,0 +1,25 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+.coverage
+dist/
+build/
+results/
+ingest_output/
+.env
+.env.*
+!.env.example
+
+# Media & trace files
+*.[mM][oO][vV]
+*.[mM][pP]4
+*.[oO][gG][gG]
+*.[mM]4[aA]
+*.[wW][aA][vV]
+*.[mM][pP]3
+*[tT][rR][aA][cC][eE]*
+*adsb*
+.DS_Store
+
