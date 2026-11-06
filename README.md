@@ -56,7 +56,7 @@ skyhear clip.mp4 --region "North America" --date 2026-06-07
 
 ### Data Sources & Speed
 
-- **`--date <YYYY-MM-DD>`**: Automatically streams and extracts true ground-radar traces from open [ADS-B daily archives](https://github.com/adsblol) (supported from 2023 onwards via `globe_history_YYYY`), with automatic fallback to [OpenSky Network](https://opensky-network.org/) if that date's archive is not yet published. For any given date, the first run takes **~15–30 seconds** (extracting regional flights), and subsequent runs for that same date are **instant (0s)** from local disk cache (`~/.skyhear/adsb_cache/`).
+- **`--date <YYYY-MM-DD>`**: Automatically streams and extracts true ground-radar traces from open [ADS-B daily archives](https://github.com/adsblol) (supported from 2023 up to yesterday's flights via `globe_history_YYYY`), with automatic fallback to [OpenSky Network](https://opensky-network.org/) if that date's archive is not yet published. For any given date, the first run takes **~15–30 seconds** (extracting regional flights), and subsequent runs for that same date are **instant (0s)** from local disk cache (`~/.skyhear/adsb_cache/`).
 - **`--fresh`**: Pings live regional ADS-B feeds in real time via `adsb.lol` for recordings made within the past hour. Takes **~1–2 seconds** to fetch.
 
 > [!NOTE]

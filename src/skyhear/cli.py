@@ -376,7 +376,10 @@ def main(
             if ct:
                 dt = datetime.fromisoformat(ct.replace("Z", "+00:00"))
                 recording_utc_start = dt.timestamp()
-                click.echo(f"⏱️  Time: {dt.strftime('%H:%M:%S UTC')} (camera metadata)")
+                # Differentiate video vs audio container recording metadata
+                is_video = any(s.type == "video" for s in container.streams)
+                source_label = "video recording metadata" if is_video else "audio recording metadata"
+                click.echo(f"⏱️  Time: {dt.strftime('%H:%M:%S UTC')} ({source_label})")
         except Exception:
             pass
 

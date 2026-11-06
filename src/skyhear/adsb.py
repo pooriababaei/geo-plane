@@ -577,12 +577,14 @@ def download_github_traces(
         logger.info("Loaded %d cached GitHub archive tracks from %s", len(cached_tracks), date_dir)
         return cached_tracks
 
-    # Extract year from date string (format YYYY-MM-DD or YYYY.MM.DD)
-    year = date.replace("/", "-").replace(".", "-").split("-")[0]
+    # Extract year from date string and format tag with dots (vYYYY.MM.DD)
+    date_normalized = date.replace("/", "-").replace(".", "-")
+    year = date_normalized.split("-")[0]
     repo_name = f"globe_history_{year}"
+    date_dots = date_normalized.replace("-", ".")
 
     # adsblol tag naming: vYYYY.MM.DD-planes-readsb-prod-0
-    tag = f"v{date}-planes-readsb-prod-0"
+    tag = f"v{date_dots}-planes-readsb-prod-0"
     api_url = f"https://api.github.com/repos/adsblol/{repo_name}/releases/tags/{tag}"
 
     logger.info("Looking up GitHub ADS-B archive release (%s): %s", repo_name, tag)
@@ -599,69 +601,84 @@ def download_github_traces(
     if not tar_assets:
         return []
 
-    logger.info("Streaming and extracting %s flights for %s from GitHub archive...", tag, bbox)
+    total_download_bytes = sum(a.get("size", 0) for a in tar_assets)
+    total_mb = total_download_bytes / (1024 * 1024)
+    import click
+    click.echo(f"📦 Found daily ADS-B archive ({len(tar_assets)} parts, {total_mb:.1f} MB total).")
+
     matched_tracks: list[FlightTrack] = []
 
-    # Stream download parts and extract matching planes on the fly
+    # Stream download parts with progress bar and extract matching planes
     with tempfile.NamedTemporaryFile(suffix=".tar") as temp_tar:
-        for asset in tar_assets:
-            download_url = asset.get("browser_download_url")
-            logger.info("Downloading archive asset %s...", asset.get("name"))
-            try:
-                req_asset = urllib.request.Request(download_url, headers={"User-Agent": "skyhear/0.1"})
-                with urllib.request.urlopen(req_asset, timeout=60) as resp_asset:
-                    while chunk := resp_asset.read(1024 * 1024):
-                        temp_tar.write(chunk)
-            except Exception as exc:
-                logger.warning("Error streaming %s: %s", asset.get("name"), exc)
-                break
+        with click.progressbar(
+            length=total_download_bytes,
+            label="⬇️  Downloading & caching flight archive",
+            show_percent=True,
+            show_eta=True,
+        ) as bar:
+            for asset in tar_assets:
+                download_url = asset.get("browser_download_url")
+                try:
+                    req_asset = urllib.request.Request(download_url, headers={"User-Agent": "skyhear/0.1"})
+                    with urllib.request.urlopen(req_asset, timeout=120) as resp_asset:
+                        while chunk := resp_asset.read(1024 * 1024):
+                            temp_tar.write(chunk)
+                            bar.update(len(chunk))
+                except Exception as exc:
+                    logger.warning("Error streaming %s: %s", asset.get("name"), exc)
+                    break
 
         temp_tar.flush()
         temp_tar.seek(0)
 
         # Open and scan tar archive
+        click.echo("🔎 Scanning and extracting regional flights for target airspace...")
         try:
             with tarfile.open(temp_tar.name, mode="r:*") as tar:
-                for member in tar:
-                    if not member.isfile() or not member.name.endswith(".json"):
-                        continue
-                    f = tar.extractfile(member)
-                    if not f:
-                        continue
-                    try:
-                        raw_bytes = f.read()
-                        if raw_bytes[:2] == b"\x1f\x8b":
-                            data = json.loads(gzip.decompress(raw_bytes))
-                        else:
-                            data = json.loads(raw_bytes)
-
-                        track = parse_readsb_trace(data)
-                        if track is None:
+                members = [m for m in tar.getmembers() if m.isfile() and m.name.endswith(".json")]
+                with click.progressbar(
+                    members,
+                    label="✈️  Extracting aircraft trajectories",
+                    show_percent=True,
+                ) as bar:
+                    for member in bar:
+                        f = tar.extractfile(member)
+                        if not f:
                             continue
+                        try:
+                            raw_bytes = f.read()
+                            if raw_bytes[:2] == b"\x1f\x8b":
+                                data = json.loads(gzip.decompress(raw_bytes))
+                            else:
+                                data = json.loads(raw_bytes)
 
-                        # Check bounding box overlap
-                        lat_in = (track.lat >= bbox.min_lat) & (track.lat <= bbox.max_lat)
-                        lon_in = (track.lon >= bbox.min_lon) & (track.lon <= bbox.max_lon)
-                        if not np.any(lat_in & lon_in):
-                            continue
-
-                        # If target_time specified, verify time overlap
-                        if target_time is not None:
-                            if track.timestamps[-1] < target_time - 1800 or track.timestamps[0] > target_time + 1800:
+                            track = parse_readsb_trace(data)
+                            if track is None:
                                 continue
 
-                        # Save to cache
-                        dest_file = date_dir / f"trace_{track.icao24}.json"
-                        with open(dest_file, "w", encoding="utf-8") as out_fp:
-                            json.dump(data, out_fp)
+                            # Check bounding box overlap
+                            lat_in = (track.lat >= bbox.min_lat) & (track.lat <= bbox.max_lat)
+                            lon_in = (track.lon >= bbox.min_lon) & (track.lon <= bbox.max_lon)
+                            if not np.any(lat_in & lon_in):
+                                continue
 
-                        matched_tracks.append(track)
-                    except Exception:
-                        continue
+                            # If target_time specified, verify time overlap
+                            if target_time is not None:
+                                if track.timestamps[-1] < target_time - 1800 or track.timestamps[0] > target_time + 1800:
+                                    continue
+
+                            # Save to cache
+                            dest_file = date_dir / f"trace_{track.icao24}.json"
+                            with open(dest_file, "w", encoding="utf-8") as out_fp:
+                                json.dump(data, out_fp)
+
+                            matched_tracks.append(track)
+                        except Exception:
+                            continue
         except Exception as exc:
             logger.warning("Error reading tarball stream: %s", exc)
 
-    logger.info("Extracted and cached %d matching flight tracks to %s", len(matched_tracks), date_dir)
+    click.echo(f"✅ Extracted and cached {len(matched_tracks)} flights matching target airspace.")
     return matched_tracks
 
 
