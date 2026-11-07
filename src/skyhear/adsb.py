@@ -745,22 +745,38 @@ def load_readsb_traces_dir(
             else:
                 with open(f, "r", encoding="utf-8") as fp:
                     data = json.load(fp)
+            raw_trace = data.get("trace", [])
+            if not raw_trace:
+                continue
+
             if target_time is not None:
                 base_t = float(data.get("timestamp", 0.0))
-                raw_trace = data.get("trace", [])
-                if not raw_trace:
-                    continue
                 try:
                     if (base_t + float(raw_trace[-1][0])) < target_time - 1800 or (base_t + float(raw_trace[0][0])) > target_time + 1800:
                         continue
                 except (IndexError, ValueError, TypeError):
                     continue
 
+            # Fast bounding box pre-filter on raw trace before expensive interpolation
+            if bbox is not None:
+                margin_deg = 0.45
+                sample_pts = raw_trace[::max(1, len(raw_trace) // 15)]
+                p_lats = [pt[1] for pt in sample_pts if len(pt) > 2 and pt[1] is not None]
+                p_lons = [pt[2] for pt in sample_pts if len(pt) > 2 and pt[2] is not None]
+                if p_lats and p_lons:
+                    if (
+                        max(p_lats) < bbox.min_lat - margin_deg
+                        or min(p_lats) > bbox.max_lat + margin_deg
+                        or max(p_lons) < bbox.min_lon - margin_deg
+                        or min(p_lons) > bbox.max_lon + margin_deg
+                    ):
+                        continue
+
             track = parse_readsb_trace(data, target_time=target_time)
             if track is None:
                 continue
 
-            # Optional bbox check (expanded with acoustic horizon buffer)
+            # Full bbox check on interpolated track
             if bbox is not None:
                 margin_deg = 0.45
                 lat_in = (track.lat >= bbox.min_lat - margin_deg) & (track.lat <= bbox.max_lat + margin_deg)

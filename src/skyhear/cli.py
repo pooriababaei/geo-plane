@@ -463,7 +463,7 @@ def main(
     # === Step 5: Search ===
     click.echo("🎯 Geolocating...")
     config = SearchConfig(
-        max_clock_offset_s=6.0 if recording_utc_start is not None else 180.0,
+        max_clock_offset_s=10.0 if recording_utc_start is not None else 180.0,
     )
     candidates = search_location(
         passes, tracks, bbox, config, recording_utc_start=recording_utc_start
